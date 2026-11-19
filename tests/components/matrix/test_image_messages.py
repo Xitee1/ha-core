@@ -195,10 +195,25 @@ async def test_image_non_commands(
 
 
 @pytest.mark.parametrize(
-    ("room_id", "url"),
+    ("room_id", "content"),
     [
-        pytest.param(TEST_BAD_ROOM, TEST_MXC_URI, id="not_listening_room"),
-        pytest.param(CATCH_ALL_ROOM, "https://example.com/photo.jpg", id="no_mxc_url"),
+        pytest.param(TEST_BAD_ROOM, {"url": TEST_MXC_URI}, id="not_listening_room"),
+        pytest.param(
+            CATCH_ALL_ROOM, {"url": "https://example.com/photo.jpg"}, id="no_mxc_url"
+        ),
+        pytest.param(
+            CATCH_ALL_ROOM,
+            {
+                "url": TEST_MXC_URI,
+                "m.new_content": {
+                    "msgtype": "m.image",
+                    "body": "photo.jpg",
+                    "url": TEST_MXC_URI,
+                },
+                "m.relates_to": {"rel_type": "m.replace", "event_id": "original_id"},
+            },
+            id="edit",
+        ),
     ],
 )
 async def test_image_ignored(
@@ -206,15 +221,15 @@ async def test_image_ignored(
     matrix_bot: MatrixBot,
     command_events: list[Event],
     room_id: str,
-    url: str,
+    content: dict[str, Any],
 ) -> None:
-    """Test that images are ignored outside listening rooms or without mxc URL."""
-    message = create_image_message(body="photo.jpg", url=url)
+    """Test that images are ignored outside listening rooms, without mxc URL or as edit."""
+    message = create_image_message(body="photo.jpg", **content)
 
     await _handle_message(hass, matrix_bot, room_id, message)
 
     assert len(command_events) == 0
-    assert not matrix_bot.is_received_media(url)
+    assert not matrix_bot.is_received_media(content["url"])
 
 
 async def test_text_message_unchanged(

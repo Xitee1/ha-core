@@ -299,12 +299,17 @@ class MatrixBot:
         """Handle an image message, with the optional caption as text."""
         if room_id not in self._listening_rooms.values():
             return
+        content = message.source["content"]
+        # Edits are not new messages, so they must not trigger commands again.
+        match content:
+            case {"m.relates_to": {"rel_type": "m.replace"}}:
+                _LOGGER.debug("Ignoring image edit: %s", message.event_id)
+                return
         # Encrypted attachments have no plain mxc URL.
         if (mxc_match := MXC_URI_REGEX.match(message.url)) is None:
             _LOGGER.debug("Ignoring image without mxc URL: %s", message.event_id)
             return
 
-        content = message.source["content"]
         # MSC2530: the body is a caption if a different filename is set.
         filename = content.get("filename")
         caption = (
