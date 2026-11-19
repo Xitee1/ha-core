@@ -1,4 +1,18 @@
 {
+  "exceptions": {
+    "media_download_failed": {
+      "message": "Matrix media {mxc_uri} could not be downloaded."
+    },
+    "media_not_playable": {
+      "message": "Matrix media {media_content_id} can't be played, it can only be used as an image."
+    },
+    "unknown_media": {
+      "message": "Matrix media {media_content_id} is unknown. Only images recently received in a listening room are available."
+    },
+    "unsupported_media_type": {
+      "message": "Matrix media {mxc_uri} has the unsupported content type {content_type}. Only images are supported."
+    }
+  },
   "selector": {
     "send_message_data": {
       "fields": {

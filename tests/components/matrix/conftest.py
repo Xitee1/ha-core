@@ -4,6 +4,7 @@ from collections.abc import Generator
 from pathlib import Path
 import re
 import tempfile
+from typing import Any
 from unittest.mock import patch
 
 from nio import (
@@ -15,6 +16,7 @@ from nio import (
     LoginError,
     LoginResponse,
     Response,
+    RoomMessageImage,
     RoomResolveAliasError,
     RoomResolveAliasResponse,
     UploadResponse,
@@ -69,6 +71,10 @@ TEST_MXID = "@user:example.com"
 TEST_DEVICE_ID = "FAKEID"
 TEST_PASSWORD = "password"
 TEST_TOKEN = "access_token"
+TEST_SENDER = "@SomeUser:example.com"
+TEST_EVENT_ID = "fake_event_id"
+TEST_MXC_URI = "mxc://example.com/FakeMediaId"
+TEST_MEDIA_CONTENT_ID = "media-source://matrix/example.com/FakeMediaId"
 
 NIO_IMPORT_PREFIX = "homeassistant.components.matrix.nio."
 
@@ -264,6 +270,21 @@ MOCK_REACTION_COMMANDS = {
         },
     },
 }
+
+
+def create_image_message(**content: Any) -> RoomMessageImage:
+    """Create an 'm.image' event as received from the homeserver."""
+    event = RoomMessageImage.from_dict(
+        {
+            "type": "m.room.message",
+            "event_id": TEST_EVENT_ID,
+            "sender": TEST_SENDER,
+            "origin_server_ts": 123456789,
+            "content": {"msgtype": "m.image", "url": TEST_MXC_URI} | content,
+        }
+    )
+    assert isinstance(event, RoomMessageImage)
+    return event
 
 
 @pytest.fixture

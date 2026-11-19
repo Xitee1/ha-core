@@ -6,16 +6,18 @@ import logging
 import mimetypes
 import os
 import re
-from typing import Any, Final, NewType, Required, TypedDict
+from typing import TYPE_CHECKING, Any, Final, NewType, Required, TypedDict
 
 import aiofiles.os
 from nio import AsyncClient, Event, MatrixRoom
-from nio.events.room_events import ReactionEvent, RoomMessageText
+from nio.events.room_events import ReactionEvent, RoomMessageImage, RoomMessageText
 from nio.responses import (
+    DownloadError,
     ErrorResponse,
     JoinError,
     JoinResponse,
     LoginError,
+    MemoryDownloadResponse,
     Response,
     RoomResolveAliasResponse,
     UploadError,
@@ -26,6 +28,7 @@ from nio.responses import (
 from PIL import Image
 import probatio
 
+from homeassistant.components.media_source import generate_media_source_id
 from homeassistant.const import (
     CONF_NAME,
     CONF_PASSWORD,
@@ -40,6 +43,7 @@ from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers.json import save_json
 from homeassistant.helpers.typing import ConfigType
 from homeassistant.util.json import JsonObjectType, load_json_object
+from homeassistant.util.limited_size_dict import LimitedSizeDict
 
 from .const import (
     ATTR_FORMAT,
@@ -69,6 +73,9 @@ EVENT_MATRIX_COMMAND = "matrix_command"
 
 DEFAULT_CONTENT_TYPE = "application/octet-stream"
 
+MXC_URI_REGEX = re.compile(r"^mxc://(?P<server_name>[^/\s]+)/(?P<media_id>[\w-]+)$")
+RECEIVED_MEDIA_LIMIT = 200
+
 
 WordCommand = NewType("WordCommand", str)
 ExpressionCommand = NewType("ExpressionCommand", re.Pattern)
@@ -76,6 +83,10 @@ ReactionCommand = NewType("ReactionCommand", str)
 RoomAlias = NewType("RoomAlias", str)  # Starts with "#"
 RoomID = NewType("RoomID", str)  # Starts with "!"
 RoomAnyID = RoomID | RoomAlias
+
+
+class MatrixDownloadError(HomeAssistantError):
+    """Error to indicate that media could not be downloaded."""
 
 
 class ConfigCommand(TypedDict, total=False):
@@ -184,6 +195,10 @@ class MatrixBot:
         self._expression_commands: dict[RoomID, list[ConfigCommand]] = {}
         self._reaction_commands: dict[RoomID, dict[ReactionCommand, ConfigCommand]] = {}
         self._unparsed_commands = commands
+        # Only media received in listening rooms may be served by the media source.
+        self._received_media: LimitedSizeDict[str, None] = LimitedSizeDict(
+            size_limit=RECEIVED_MEDIA_LIMIT
+        )
 
         async def stop_client(event: HassEvent) -> None:
             """Run once when Home Assistant stops."""
@@ -206,7 +221,8 @@ class MatrixBot:
             _LOGGER.debug("Finished initial sync for %s", self._mx_id)
 
             self._client.add_event_callback(
-                self._handle_room_message, (ReactionEvent, RoomMessageText)
+                self._handle_room_message,
+                (ReactionEvent, RoomMessageText, RoomMessageImage),
             )
 
             _LOGGER.debug("Starting sync_forever for %s", self._mx_id)
@@ -245,9 +261,9 @@ class MatrixBot:
 
     async def _handle_room_message(self, room: MatrixRoom, message: Event) -> None:
         """Handle a message sent to a Matrix room."""
-        # Corresponds to message type 'm.text' and NOT other
+        # Corresponds to message types 'm.text' and 'm.image' and NOT other
         # RoomMessage subtypes, like 'm.notice' and 'm.emote'.
-        if not isinstance(message, (RoomMessageText, ReactionEvent)):
+        if not isinstance(message, (RoomMessageText, RoomMessageImage, ReactionEvent)):
             return
         # Don't respond to our own messages.
         if message.sender == self._mx_id:
@@ -272,11 +288,53 @@ class MatrixBot:
                 self.hass.bus.async_fire(EVENT_MATRIX_COMMAND, message_data)
             return
 
-        _LOGGER.debug("Handling message: %s", message.body)
+        if isinstance(message, RoomMessageImage):
+            self._handle_image_message(room_id, message)
+            return
 
-        if message.body.startswith("!"):
+        _LOGGER.debug("Handling message: %s", message.body)
+        self._fire_message_commands(room_id, message, message.body, {})
+
+    def _handle_image_message(self, room_id: RoomID, message: RoomMessageImage) -> None:
+        """Handle an image message, with the optional caption as text."""
+        if room_id not in self._listening_rooms.values():
+            return
+        # Encrypted attachments have no plain mxc URL.
+        if (mxc_match := MXC_URI_REGEX.match(message.url)) is None:
+            _LOGGER.debug("Ignoring image without mxc URL: %s", message.event_id)
+            return
+
+        content = message.source["content"]
+        # MSC2530: the body is a caption if a different filename is set.
+        filename = content.get("filename")
+        caption = (
+            message.body if filename is not None and filename != message.body else ""
+        )
+        _LOGGER.debug("Handling image message: %s", caption)
+
+        self._received_media[message.url] = None
+        media_data = {
+            "media_content_id": generate_media_source_id(
+                DOMAIN, f"{mxc_match['server_name']}/{mxc_match['media_id']}"
+            )
+        }
+        match content:
+            case {"info": {"mimetype": str() as mimetype}}:
+                media_data["media_content_type"] = mimetype
+
+        self._fire_message_commands(room_id, message, caption, media_data)
+
+    def _fire_message_commands(
+        self,
+        room_id: RoomID,
+        message: RoomMessageText | RoomMessageImage,
+        text: str,
+        extra_data: dict[str, str],
+    ) -> None:
+        """Fire an event for each word or expression command matching the text."""
+        if text.startswith("!"):
             # Could trigger a single-word command.
-            pieces = message.body.split()
+            pieces = text.split()
             word = WordCommand(pieces[0].lstrip("!"))
 
             if command := self._word_commands.get(room_id, {}).get(word):
@@ -288,13 +346,13 @@ class MatrixBot:
                     "args": pieces[1:],
                     "thread_parent": self._get_thread_parent(message)
                     or message.event_id,
-                }
+                } | extra_data
 
                 self.hass.bus.async_fire(EVENT_MATRIX_COMMAND, message_data)
 
         # After single-word commands, check all regex commands in the room.
         for command in self._expression_commands.get(room_id, []):
-            match = command[CONF_EXPRESSION].match(message.body)
+            match = command[CONF_EXPRESSION].match(text)
             if not match:
                 continue
             message_data = {
@@ -304,11 +362,13 @@ class MatrixBot:
                 "event_id": message.event_id,
                 "args": match.groupdict(),
                 "thread_parent": self._get_thread_parent(message) or message.event_id,
-            }
+            } | extra_data
 
             self.hass.bus.async_fire(EVENT_MATRIX_COMMAND, message_data)
 
-    def _get_thread_parent(self, message: RoomMessageText) -> str | None:
+    def _get_thread_parent(
+        self, message: RoomMessageText | RoomMessageImage
+    ) -> str | None:
         """Get the thread parent ID from a message, or None if not in a thread."""
         match message.source:
             case {
@@ -606,6 +666,24 @@ class MatrixBot:
         await self._handle_room_send(
             target_room=target_room, message_type="m.reaction", content=content
         )
+
+    def is_received_media(self, mxc_uri: str) -> bool:
+        """Return if the media was recently received in a listening room."""
+        return mxc_uri in self._received_media
+
+    async def async_download_media(self, mxc_uri: str) -> tuple[bytes, str]:
+        """Download media from the homeserver and return content and content type."""
+        response = await self._client.download(mxc=mxc_uri)
+        if isinstance(response, DownloadError):
+            _LOGGER.debug("Unable to download media '%s': %s", mxc_uri, response)
+            raise MatrixDownloadError(
+                translation_domain=DOMAIN,
+                translation_key="media_download_failed",
+                translation_placeholders={"mxc_uri": mxc_uri},
+            )
+        if TYPE_CHECKING:
+            assert isinstance(response, MemoryDownloadResponse)
+        return response.body, response.content_type
 
     async def handle_send_message(self, service: ServiceCall) -> None:
         """Handle the send_message service."""
